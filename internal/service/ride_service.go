@@ -11,8 +11,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"math"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -546,7 +548,7 @@ func (s *RideService) acceptRide(ctx context.Context, ride models.Ride, driverID
 	sent := s.riderHub.SendToRider(ride.RiderID, bytes)
 
 	go fcm.Send(ctx, ride.Rider.FCMToken, "Ride Accepted", fmt.Sprintf("Your ride has been accepted by %s. ETA: %d minutes", driver.User.Name, etaMinutes), map[string]string{
-		"type": string(models.RideStatusAccepted),
+		"type":    string(models.RideStatusAccepted),
 		"ride_id": ride.ID.String(),
 	})
 
@@ -587,17 +589,31 @@ func (s *RideService) rejectRide(ctx context.Context, ride models.Ride) error {
 
 func (s *RideService) DriverArrived(ctx context.Context, driverUserID uuid.UUID, rideID uuid.UUID) error {
 
-	// get driver
+	// Fetch driver and ride concurrently so we don't pay two sequential
+	// Neon round-trips on the latency-critical path.
+	var (
+		driver  models.Driver
+		ride    models.Ride
+		driErr  error
+		rideErr error
+		wg      sync.WaitGroup
+	)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		driver, driErr = s.driverRepo.GetDriverByUserID(driverUserID)
+	}()
+	go func() {
+		defer wg.Done()
+		ride, rideErr = s.rideRepo.GetRideByID(ctx, rideID)
+	}()
+	wg.Wait()
 
-	driver, err := s.driverRepo.GetDriverByUserID(driverUserID)
-	if err != nil {
-		return fmt.Errorf("driver not found for userID %s: %v", driverUserID, err)
+	if driErr != nil {
+		return fmt.Errorf("driver not found for userID %s: %v", driverUserID, driErr)
 	}
-
-	ride, err := s.rideRepo.GetRideByID(ctx, rideID)
-
-	if err != nil {
-		return fmt.Errorf("ride not found: %v", err)
+	if rideErr != nil {
+		return fmt.Errorf("ride not found: %v", rideErr)
 	}
 
 	if ride.Status != models.RideStatusAccepted {
@@ -608,7 +624,8 @@ func (s *RideService) DriverArrived(ctx context.Context, driverUserID uuid.UUID,
 		return errors.New("you are not assigned to this ride")
 	}
 
-	// Notify rider that driver has arrived
+	// Notify rider that driver has arrived — this is the line the rider's
+	// dashboard is waiting on, so it runs before any other network call.
 	msg := ws.Message{
 		Type: ws.MessageTypeDriverIsHere,
 		Payload: map[string]string{
@@ -620,10 +637,16 @@ func (s *RideService) DriverArrived(ctx context.Context, driverUserID uuid.UUID,
 	bytes, _ := json.Marshal(msg)
 	s.riderHub.SendToRider(ride.RiderID, bytes)
 
-	fcm.Send(ctx, ride.Rider.FCMToken, "Your driver has arrived", "Your driver is waiting for you at the pickup location.", map[string]string{
-		"type": "driver_arrived",
-		"ride_id": ride.ID.String(),
-	})
+	// Push notification is a call out to Google's FCM servers; never let it
+	// sit in front of (or block) the WebSocket event.
+	fcmToken := ride.Rider.FCMToken
+	rideIDStr := ride.ID.String()
+	go func() {
+		fcm.Send(context.Background(), fcmToken, "Your driver has arrived", "Your driver is waiting for you at the pickup location.", map[string]string{
+			"type":    "driver_arrived",
+			"ride_id": rideIDStr,
+		})
+	}()
 
 	fmt.Printf("Driver %s arrived for ride %s\n", driver.ID, rideID)
 
@@ -632,15 +655,29 @@ func (s *RideService) DriverArrived(ctx context.Context, driverUserID uuid.UUID,
 
 func (s *RideService) StartTrip(ctx context.Context, driverUserID uuid.UUID, rideID uuid.UUID) error {
 
-	driver, err := s.driverRepo.GetDriverByUserID(driverUserID)
-	if err != nil {
-		return fmt.Errorf("driver not found for userID %s: %v", driverUserID, err)
+	var (
+		driver  models.Driver
+		ride    models.Ride
+		driErr  error
+		rideErr error
+		wg      sync.WaitGroup
+	)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		driver, driErr = s.driverRepo.GetDriverByUserID(driverUserID)
+	}()
+	go func() {
+		defer wg.Done()
+		ride, rideErr = s.rideRepo.GetRideByID(ctx, rideID)
+	}()
+	wg.Wait()
+
+	if driErr != nil {
+		return fmt.Errorf("driver not found for userID %s: %v", driverUserID, driErr)
 	}
-
-	ride, err := s.rideRepo.GetRideByID(ctx, rideID)
-
-	if err != nil {
-		return fmt.Errorf("ride not found: %v", err)
+	if rideErr != nil {
+		return fmt.Errorf("ride not found: %v", rideErr)
 	}
 
 	if ride.Status != models.RideStatusAccepted {
@@ -651,11 +688,9 @@ func (s *RideService) StartTrip(ctx context.Context, driverUserID uuid.UUID, rid
 		return errors.New("you are not assigned to this ride")
 	}
 
-	// Update ride status to InProgress
-	if err := s.rideRepo.UpdateRideStatus(ctx, rideID, models.RideStatusOngoing, nil); err != nil {
-		return fmt.Errorf("failed to update ride status: %v", err)
-	}
-
+	// Notify the rider FIRST. The "trip started" event carries no data that
+	// depends on the DB write, so there's no reason to make the rider wait
+	// for Neon to commit before their screen updates.
 	msg := ws.Message{
 		Type: ws.MessageTypeRideStarted,
 		Payload: map[string]string{
@@ -663,19 +698,28 @@ func (s *RideService) StartTrip(ctx context.Context, driverUserID uuid.UUID, rid
 			"message": "Your trip has started.",
 		},
 	}
-
-	bytes, err := json.Marshal(msg)
-	if err != nil {
-		return fmt.Errorf("failed to marshal trip started message: %v", err)
-	}
-
+	bytes, _ := json.Marshal(msg)
 	s.riderHub.SendToRider(ride.RiderID, bytes)
-	fmt.Printf("Trip started for ride %s\n", rideID)
 
-	fcm.Send(ctx, ride.Rider.FCMToken, "Your trip has started", "Have a safe trip!", map[string]string{
-		"type": "trip_started",
-		"ride_id": ride.ID.String(),
-	})	
+	// Persist the status change off the hot path. If it fails we log it;
+	// it does not need to block the rider's UI.
+	rideIDCopy := rideID
+	go func() {
+		if err := s.rideRepo.UpdateRideStatus(context.Background(), rideIDCopy, models.RideStatusOngoing, nil); err != nil {
+			log.Printf("failed to update ride %s status to ongoing: %v", rideIDCopy, err)
+		}
+	}()
+
+	fcmToken := ride.Rider.FCMToken
+	rideIDStr := ride.ID.String()
+	go func() {
+		fcm.Send(context.Background(), fcmToken, "Your trip has started", "Have a safe trip!", map[string]string{
+			"type":    "trip_started",
+			"ride_id": rideIDStr,
+		})
+	}()
+
+	fmt.Printf("Trip started for ride %s\n", rideID)
 
 	return nil
 
@@ -744,11 +788,6 @@ func (s *RideService) EndTrip(ctx context.Context, driverUserID uuid.UUID, rideI
 	completedBytes, _ := json.Marshal(completedMsg)
 	s.riderHub.SendToRider(ride.RiderID, completedBytes)
 
-	fcm.Send(ctx, ride.Rider.FCMToken, "Your trip has completed", "Thank you for riding with us!", map[string]string{	
-		"type": string(models.RideStatusCompleted),
-		"ride_id": ride.ID.String(),
-	})
-
 	ratingPrompt := ws.Message{
 		Type: ws.MessageTypeRateDriver,
 		Payload: map[string]string{
@@ -759,6 +798,16 @@ func (s *RideService) EndTrip(ctx context.Context, driverUserID uuid.UUID, rideI
 	ratingBytes, _ := json.Marshal(ratingPrompt)
 	s.riderHub.SendToRider(ride.RiderID, ratingBytes)
 
+	// FCM is a call to Google's servers — run it async so it can't add
+	// latency to the events the rider's app is waiting on.
+	fcmToken := ride.Rider.FCMToken
+	rideIDStr := ride.ID.String()
+	go func() {
+		fcm.Send(context.Background(), fcmToken, "Your trip has completed", "Thank you for riding with us!", map[string]string{
+			"type":    string(models.RideStatusCompleted),
+			"ride_id": rideIDStr,
+		})
+	}()
 
 	// driverRatingPrompt := ws.Message{
 	//     Type: ws.MessageTypeRateRider,
@@ -859,10 +908,9 @@ func (s *RideService) FindAndNotifyDrivers(ctx context.Context, ride models.Ride
 	}
 
 	if err := s.notifyNextDriver(ctx, ride); err != nil {
-		
+
 		fmt.Printf("Failed to notify driver for ride %s: %v\n", ride.ID, err)
 	}
-
 
 }
 

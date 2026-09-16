@@ -7,6 +7,7 @@ import (
 	"drivo/internal/ws"
 	"encoding/json"
 	"fmt"
+	"log"
 
 	"github.com/google/uuid"
 )
@@ -38,12 +39,14 @@ type SendMessageInput struct {
 
 func (s *ChatService) notifyRider(riderID uuid.UUID, msg ws.Message) {
 	bytes, _ := json.Marshal(msg)
-	s.riderHub.SendToRider(riderID, bytes)
+	ok := s.riderHub.SendToRider(riderID, bytes)
+	log.Printf("[CHAT] notifyRider %s delivered=%v", riderID, ok)
 }
 
 func (s *ChatService) notifyDriver(driverUserID uuid.UUID, msg ws.Message) {
 	bytes, _ := json.Marshal(msg)
-	s.driverHub.SendToDriver(driverUserID, bytes)
+	ok := s.driverHub.SendToDriver(driverUserID, bytes)
+	log.Printf("[CHAT] notifyDriver %s delivered=%v", driverUserID, ok)
 }
 
 func (s *ChatService) OpenSession(ctx context.Context, rideID, driverUserID, riderID uuid.UUID) (*models.ChatSession, error) {
@@ -83,6 +86,8 @@ func (s *ChatService) SendMessage(ctx context.Context, input SendMessageInput) e
 		return fmt.Errorf("chat is closed, trip has ended")
 	}
 
+	log.Printf("[CHAT] SendMessage from %s (%s) on ride %s → broadcasting", input.SenderID, input.SenderType, input.RideID)
+
 	if input.SenderType == models.SenderTypeDriver && session.DriverID != input.SenderID {
 		return fmt.Errorf("you are not the driver on this ride")
 	}
@@ -103,10 +108,10 @@ func (s *ChatService) SendMessage(ctx context.Context, input SendMessageInput) e
 	}
 
 	payload := map[string]interface{}{
-		"id":           msg.ID,
-		"session_id": session.ID,
-		"ride_id":    input.RideID,
-		"sender_id":  input.SenderID,
+		"id":          msg.ID,
+		"session_id":  session.ID,
+		"ride_id":     input.RideID,
+		"sender_id":   input.SenderID,
 		"sender_type": input.SenderType,
 		"message":     input.Message,
 		"created_at":  msg.CreatedAt,
@@ -114,7 +119,7 @@ func (s *ChatService) SendMessage(ctx context.Context, input SendMessageInput) e
 
 	if input.SenderType == models.SenderTypeDriver {
 		s.notifyRider(session.RiderID, ws.Message{Type: ws.MessageTypeChatMessage, Payload: payload})
-	}else {
+	} else {
 		s.notifyDriver(session.DriverID, ws.Message{Type: ws.MessageTypeChatMessage, Payload: payload})
 	}
 
@@ -138,13 +143,13 @@ func (s *ChatService) GetHistory(ctx context.Context, rideID uuid.UUID, requeste
 		return nil, err
 	}
 
-	go s.chatRepo.MarkMessagesRead(ctx, session.ID, requesterID)
+	go s.chatRepo.MarkMessagesRead(context.Background(), session.ID, requesterID)
 
 	return messages, nil
 }
 
 func (s *ChatService) CloseSession(ctx context.Context, rideID uuid.UUID, riderID uuid.UUID, driverUserID uuid.UUID) error {
-	
+
 	if err := s.chatRepo.CloseSession(ctx, rideID); err != nil {
 		return fmt.Errorf("failed to close chat session: %v", err)
 	}
@@ -154,7 +159,6 @@ func (s *ChatService) CloseSession(ctx context.Context, rideID uuid.UUID, riderI
 		Payload: map[string]interface{}{
 			"ride_id": rideID,
 			"message": "Chat has been closed",
-
 		},
 	}
 
@@ -163,4 +167,3 @@ func (s *ChatService) CloseSession(ctx context.Context, rideID uuid.UUID, riderI
 
 	return nil
 }
-

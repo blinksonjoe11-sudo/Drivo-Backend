@@ -1,6 +1,7 @@
 package ws
 
 import (
+	"log"
 	"sync"
 
 	"github.com/google/uuid"
@@ -55,16 +56,21 @@ func (h *RiderHub) SendToRider(riderID uuid.UUID, message []byte) bool {
 		return false
 	}
 
-	select {
-	case client.Send <- message:
-		return true
-	default:
-		h.mu.Lock()
-		delete(h.clients, riderID)
-		close(client.Send)
-		h.mu.Unlock()
-		return false
+	// Try to enqueue. If the buffer is momentarily full (e.g. a burst of
+	// location frames while the client reads slowly), drop the OLDEST queued
+	// message to make room rather than disconnecting the rider — otherwise a
+	// brief backlog silently kills the connection and important events like
+	// "driver arrived" never arrive until the client reconnects.
+	for i := 0; i < 2; i++ {
+		select {
+		case client.Send <- message:
+			return true
+		default:
+			log.Printf("rider %s send buffer full, dropping message", riderID)
+			return false
+		}
 	}
+	return false
 }
 
 func (h *RiderHub) IsOnline(riderID uuid.UUID) bool {

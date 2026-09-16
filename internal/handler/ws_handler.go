@@ -111,7 +111,7 @@ func (h *WSHandler) RiderConnect(c *gin.Context) {
 }
 
 func (h *WSHandler) riderWritePump(client *ws.RiderClient, conn *websocket.Conn) {
-	ticker := time.NewTicker((90 * time.Second * 9) / 10)
+	ticker := time.NewTicker(50 * time.Second)
 	defer func() {
 		ticker.Stop()
 		conn.Close()
@@ -143,7 +143,7 @@ func (h *WSHandler) riderReadPump(client *ws.RiderClient, conn *websocket.Conn) 
 	}()
 
 	conn.SetReadLimit(10240)
-	conn.SetReadDeadline(time.Now().Add(120 * time.Second))
+	conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 	conn.SetPongHandler(func(string) error {
 		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 		return nil
@@ -314,7 +314,8 @@ func (h *WSHandler) handlePoolStartTrip(driverUserID uuid.UUID, payload interfac
 	var input ws.PoolTripActionPayload
 
 	if err := json.Unmarshal(raw, &input); err != nil {
-		log.Panicf("invalid start_trip payload: %v", err)
+		log.Printf("invalid pool start_trip payload from driver %s: %v", driverUserID, err)
+		return
 	}
 
 	poolID, err := uuid.Parse(input.PoolID)

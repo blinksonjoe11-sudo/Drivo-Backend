@@ -1,6 +1,7 @@
 package ws
 
 import (
+	"log"
 	"sync"
 
 	"github.com/google/uuid"
@@ -21,7 +22,6 @@ func NewHub() *Hub {
 	}
 }
 
-
 func (h *Hub) Run() {
 	for {
 		select {
@@ -41,7 +41,6 @@ func (h *Hub) Run() {
 	}
 }
 
-
 func (h *Hub) SendToDriver(driverID uuid.UUID, message []byte) bool {
 	h.mu.RLock()
 	client, ok := h.clients[driverID]
@@ -51,19 +50,19 @@ func (h *Hub) SendToDriver(driverID uuid.UUID, message []byte) bool {
 		return false
 	}
 
-	select {
-	case client.Send <- message:
-		return true
-	default:
-		
-		h.mu.Lock()
-		delete(h.clients, driverID)
-		close(client.Send)
-		h.mu.Unlock()
-		return false
+	// Drop the oldest queued message on a momentarily full buffer instead of
+	// disconnecting the driver (see RiderHub.SendToRider for rationale).
+	for i := 0; i < 2; i++ {
+		select {
+		case client.Send <- message:
+			return true
+		default:
+			log.Printf("driver %s send buffer full, dropping message", driverID)
+			return false
+		}
 	}
+	return false
 }
-
 
 func (h *Hub) IsOnline(driverID uuid.UUID) bool {
 	h.mu.RLock()
@@ -71,7 +70,6 @@ func (h *Hub) IsOnline(driverID uuid.UUID) bool {
 	_, ok := h.clients[driverID]
 	return ok
 }
-
 
 func (h *Hub) GetOnlineDriverIDs() []uuid.UUID {
 	h.mu.RLock()
