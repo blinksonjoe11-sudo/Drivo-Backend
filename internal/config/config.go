@@ -9,12 +9,8 @@ import (
 )
 
 type Config struct {
-	PORT    string
-	DB_HOST string
-	DB_PASSWORD      string
-	DB_USER          string
-	DB_NAME          string
-	DB_PORT          string
+	PORT                    string
+	DB_HOST                 string
 	JWTSecret               string
 	CLOUDINARY_URL          string
 	REDIS_URL               string
@@ -22,117 +18,54 @@ type Config struct {
 	MailjetSecretKey        string
 	MailjetFromEmail        string
 	MailjetFromName         string
-	FirebaseCredentialsPath string `env:"FIREBASE_CREDENTIALS_PATH"`
+	FirebaseCredentialsPath string
 }
 
 func Load() (Config, error) {
+	// Loads .env for local dev. On Render/prod the file won't exist and
+	// the real env vars are already set, so we ignore the error.
+	_ = godotenv.Load()
 
-	godotenv.Load()
-
-	port, err := extractText("PORT")
-
-	if err != nil {
-		return Config{}, fmt.Errorf("Port cant be empty")
+	cfg := Config{
+		// Render injects PORT automatically; default keeps local dev working.
+		PORT:                    getOrDefault("PORT", "8080"),
+		FirebaseCredentialsPath: os.Getenv("FIREBASE_CREDENTIALS_PATH"),
 	}
 
-	db_host, err := extractText("DB_HOST")
-
-	if err != nil {
-		return Config{}, fmt.Errorf("cannot find host")
+	// Every var below is required. Collect them all so one deploy log
+	// shows every missing key instead of only the first.
+	required := map[string]*string{
+		"DB_HOST":            &cfg.DB_HOST,
+		"JWTSecret":          &cfg.JWTSecret,
+		"CLOUDINARY_URL":     &cfg.CLOUDINARY_URL,
+		"REDIS_URL":          &cfg.REDIS_URL,
+		"MAILJET_API_KEY":    &cfg.MailjetAPIKey,
+		"MAILJET_SECRET_KEY": &cfg.MailjetSecretKey,
+		"MAILJET_FROM_EMAIL": &cfg.MailjetFromEmail,
+		"MAILJET_FROM_NAME":  &cfg.MailjetFromName,
 	}
 
-	db_user, err := extractText("DB_USER")
-
-	if err != nil {
-		return Config{}, fmt.Errorf("cannot find name")
+	var missing []string
+	for key, dest := range required {
+		val := strings.TrimSpace(os.Getenv(key))
+		if val == "" {
+			missing = append(missing, key)
+			continue
+		}
+		*dest = val
 	}
 
-	db_port, err := extractText("DB_PORT")
-
-	if err != nil {
-		return Config{}, fmt.Errorf("cannot find PORT")
+	if len(missing) > 0 {
+		return Config{}, fmt.Errorf("missing required environment variables: %s",
+			strings.Join(missing, ", "))
 	}
-
-	db_name, err := extractText("DB_NAME")
-
-	if err != nil {
-		return Config{}, fmt.Errorf("cannot find name")
-	}
-
-	db_pass, err := extractText("DB_PASSWORD")
-
-	if err != nil {
-		return Config{}, fmt.Errorf("cannot find pass")
-	}
-
-	jwtSecret, err := extractText("JWTSecret")
-
-	if err != nil {
-		return Config{}, fmt.Errorf("cannot find host")
-	}
-
-	cloudinary, err := extractText("CLOUDINARY_URL")
-
-	if err != nil {
-		return Config{}, fmt.Errorf("cloudinary not found")
-	}
-
-	redisURL, err := extractText("REDIS_URL")
-
-	if err != nil {
-		return Config{}, fmt.Errorf("redis url not found")
-	}
-
-	mailjetAPIKey, err := extractText("MAILJET_API_KEY")
-
-	if err != nil {
-		return Config{}, fmt.Errorf("Mailjet API key not found")
-	}
-
-	mailjetSecretKey, err := extractText("MAILJET_SECRET_KEY")
-
-	if err != nil {
-		return Config{}, fmt.Errorf("Mailjet secret key not found")
-	}
-
-	mailjetFromEmail, err := extractText("MAILJET_FROM_EMAIL")
-
-	if err != nil {
-		return Config{}, fmt.Errorf("Mailjet from email not found")
-	}
-
-	mailJetFromName, err := extractText("MAILJET_FROM_NAME")
-
-	if err != nil {
-		return Config{}, fmt.Errorf("Mailjet from name not found")
-	}
-
-	return Config{
-		PORT:    port,
-		DB_HOST: db_host,
-		DB_PASSWORD:      db_pass,
-		DB_USER:          db_user,
-		DB_NAME:          db_name,
-		DB_PORT:          db_port,
-		JWTSecret:        jwtSecret,
-		CLOUDINARY_URL:   cloudinary,
-		REDIS_URL:        redisURL,
-		MailjetAPIKey:    mailjetAPIKey,
-		MailjetSecretKey: mailjetSecretKey,
-		MailjetFromEmail: mailjetFromEmail,
-		MailjetFromName:  mailJetFromName,
-	}, nil
-}
-
-func extractText(key string) (string, error) {
-
-	cf := os.Getenv(key)
-
-	if cf == "" {
-		return "", fmt.Errorf("Cant be empty")
-	}
-
-	cfg := strings.TrimSpace(cf)
 
 	return cfg, nil
+}
+
+func getOrDefault(key, fallback string) string {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		return v
+	}
+	return fallback
 }
